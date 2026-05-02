@@ -1,0 +1,5 @@
+# Normalize line endings: LF in the repo, CRLF on Windows checkout
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf

@@ -1,23 +1,10 @@
-# controller.py
+# controller.py — Fixed autonomous vehicle controller
+# Author: Benjamin McLaren
 #
-# Faulty decision logic for the 2026 Autonomous Newbie Project.
-# Recruits will mainly modify this file.
-#
-# Sign convention:
-# lane_offset_m:
-#   negative = vehicle is left of lane center
-#   positive = vehicle is right of lane center
-#
-# heading_error_deg:
-#   negative = vehicle heading points left of desired direction
-#   positive = vehicle heading points right of desired direction
-#
-# Steering output semantics:
-# "LEFT" means command the vehicle to steer / move left.
-# "RIGHT" means command the vehicle to steer / move right.
-# Therefore:
-# - positive lane_offset_m means vehicle is right of center, so LEFT is corrective
-# - positive heading_error_deg means vehicle points right of desired direction, so LEFT is corrective
+# Sign conventions:
+#   lane_offset_m:      negative = left of centre,  positive = right of centre
+#   heading_error_deg:  negative = pointing left,    positive = pointing right
+#   Steering LEFT corrects positive offset/heading. RIGHT corrects negative.
 
 VALID_STEERING = {"LEFT", "RIGHT", "STRAIGHT"}
 VALID_SPEED = {"ACCELERATE", "SLOW", "STOP"}
@@ -34,110 +21,76 @@ def controller(
     sensor_valid
 ):
     """
-    Returns:
-        (steering, speed_action)
-
-        steering:
-            "LEFT", "RIGHT", "STRAIGHT"
-
-        speed_action:
-            "ACCELERATE", "SLOW", "STOP"
+    Returns (steering, speed_action).
+      steering:     "LEFT" | "RIGHT" | "STRAIGHT"
+      speed_action: "ACCELERATE" | "SLOW" | "STOP"
     """
 
-    DANGER_OBSTACLE_M = 1.0
-    CAUTION_OBSTACLE_M = 2.0
+    DANGER_OBSTACLE_M  = 1.0   # brake hard within this distance
+    CAUTION_OBSTACLE_M = 2.0   # slow down within this distance
 
-    MILD_HEADING_DEG = 3.0
+    MILD_HEADING_DEG  = 3.0
     LARGE_HEADING_DEG = 15.0
 
-    MILD_OFFSET_M = 0.15
+    MILD_OFFSET_M  = 0.15
     LARGE_OFFSET_M = 0.40
 
     HIGH_SPEED_MPS = 3.0
 
-    centered = abs(lane_offset_m) <= MILD_OFFSET_M
-    small_heading_error = abs(heading_error_deg) <= MILD_HEADING_DEG
-
-    steering = "STRAIGHT"
-    speed_action = "ACCELERATE"
-
+    # 1. Sensor failure — cannot trust any input
     if not sensor_valid:
         return "STRAIGHT", "STOP"
 
-    if centered and small_heading_error:
-        steering = "STRAIGHT"
-        speed_action = "ACCELERATE"
-
-    elif speed_mps >= HIGH_SPEED_MPS:
-        if heading_error_deg > LARGE_HEADING_DEG or lane_offset_m > LARGE_OFFSET_M:
-            steering = "LEFT"
-            speed_action = "SLOW"
-
-        elif heading_error_deg < -LARGE_HEADING_DEG or lane_offset_m < -LARGE_OFFSET_M:
-            steering = "RIGHT"
-            speed_action = "SLOW"
-
-    elif obstacle_distance_m <= DANGER_OBSTACLE_M:
-        if not left_clear and not right_clear:
-            steering = "STRAIGHT"
-            speed_action = "STOP"
-
-        elif left_clear and not right_clear:
-            steering = "LEFT"
-            speed_action = "SLOW"
-
-        elif right_clear and not left_clear:
-            steering = "RIGHT"
-            speed_action = "SLOW"
-
-        elif heading_error_deg > MILD_HEADING_DEG or lane_offset_m > MILD_OFFSET_M:
-            steering = "LEFT"
-            speed_action = "SLOW"
-
-        elif heading_error_deg < -MILD_HEADING_DEG or lane_offset_m < -MILD_OFFSET_M:
-            steering = "RIGHT"
-            speed_action = "SLOW"
-
-        else:
-            steering = "LEFT"
-            speed_action = "SLOW"
-
-    elif obstacle_distance_m <= CAUTION_OBSTACLE_M:
-        if not left_clear and not right_clear:
-            steering = "STRAIGHT"
-            speed_action = "STOP"
-
-        elif left_clear and not right_clear:
-            steering = "LEFT"
-            speed_action = "SLOW"
-
-        elif right_clear and not left_clear:
-            steering = "RIGHT"
-            speed_action = "SLOW"
-
-        elif heading_error_deg > MILD_HEADING_DEG or lane_offset_m > MILD_OFFSET_M:
-            steering = "LEFT"
-            speed_action = "SLOW"
-
-        elif heading_error_deg < -MILD_HEADING_DEG or lane_offset_m < -MILD_OFFSET_M:
-            steering = "RIGHT"
-            speed_action = "SLOW"
-
-        else:
-            steering = "STRAIGHT"
-            speed_action = "SLOW"
-
+    # 2. Emergency stop — unconditional hard override
     if e_stop:
-        if obstacle_distance_m <= DANGER_OBSTACLE_M:
-            steering = "STRAIGHT"
-            speed_action = "STOP"
+        return "STRAIGHT", "STOP"
 
-    if heading_error_deg > LARGE_HEADING_DEG or lane_offset_m > LARGE_OFFSET_M:
+    # 3. Danger zone — brake hard, steer to clear side if one exists
+    if obstacle_distance_m <= DANGER_OBSTACLE_M:
+        if left_clear and not right_clear:
+            return "LEFT", "STOP"
+        elif right_clear and not left_clear:
+            return "RIGHT", "STOP"
+        else:
+            return "STRAIGHT", "STOP"
+
+    # 4. Caution zone — slow down, prefer clear side
+    if obstacle_distance_m <= CAUTION_OBSTACLE_M:
+        if not left_clear and not right_clear:
+            return "STRAIGHT", "SLOW"
+        elif left_clear and not right_clear:
+            return "LEFT", "SLOW"
+        elif right_clear and not left_clear:
+            return "RIGHT", "SLOW"
+        else:
+            # Both clear — slow and correct alignment while closing
+            if heading_error_deg > MILD_HEADING_DEG or lane_offset_m > MILD_OFFSET_M:
+                return "LEFT", "SLOW"
+            elif heading_error_deg < -MILD_HEADING_DEG or lane_offset_m < -MILD_OFFSET_M:
+                return "RIGHT", "SLOW"
+            else:
+                return "STRAIGHT", "SLOW"
+
+    # 5. Normal driving — correct heading/offset, manage speed by error severity
+    centered            = abs(lane_offset_m)     <= MILD_OFFSET_M
+    small_heading_error = abs(heading_error_deg) <= MILD_HEADING_DEG
+
+    if centered and small_heading_error:
+        return "STRAIGHT", "ACCELERATE"
+
+    # Heading error takes priority over lane offset (determines future trajectory)
+    if heading_error_deg > MILD_HEADING_DEG or lane_offset_m > MILD_OFFSET_M:
         steering = "LEFT"
-        speed_action = "ACCELERATE"
-
-    if heading_error_deg < -LARGE_HEADING_DEG or lane_offset_m < -LARGE_OFFSET_M:
+    elif heading_error_deg < -MILD_HEADING_DEG or lane_offset_m < -MILD_OFFSET_M:
         steering = "RIGHT"
-        speed_action = "ACCELERATE"
+    else:
+        steering = "STRAIGHT"
+
+    large_error = (
+        abs(heading_error_deg) > LARGE_HEADING_DEG or
+        abs(lane_offset_m)     > LARGE_OFFSET_M
+    )
+
+    speed_action = "SLOW" if (large_error or speed_mps >= HIGH_SPEED_MPS) else "ACCELERATE"
 
     return steering, speed_action
