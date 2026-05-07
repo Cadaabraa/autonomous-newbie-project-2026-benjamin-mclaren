@@ -1,4 +1,4 @@
-# controller.py — Fixed autonomous vehicle controller
+# controller.py — Autonomous vehicle controller
 # Author: Benjamin McLaren
 #
 # Sign conventions:
@@ -56,6 +56,7 @@
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Valid outputs — anything outside these sets is a bug
 VALID_STEERING = {"LEFT", "RIGHT", "STRAIGHT"}
 VALID_SPEED = {"ACCELERATE", "SLOW", "STOP"}
 
@@ -71,40 +72,67 @@ def controller(
     sensor_valid
 ):
     """
-    Returns (steering, speed_action).
+    Autonomous vehicle controller that makes steering and speed decisions
+    based on sensor inputs.
+
+    The controller uses a strict priority-based decision system — each level
+    is checked in order and returns immediately if it applies. This means
+    safety-critical conditions (sensor failure, emergency stop) always take
+    precedence over normal driving logic, with no risk of being overridden.
+
+      Priority 1 — Sensor validity:  if sensors are bad, don't trust any input
+      Priority 2 — Emergency stop:   unconditional halt regardless of anything else
+      Priority 3 — Danger zone:      obstacle within 1.0m — brake and dodge NOW
+      Priority 4 — Caution zone:     obstacle within 2.0m — slow and plan escape
+      Priority 5 — Normal driving:   correct lane position and manage speed
+
+    Returns:
       steering:     "LEFT" | "RIGHT" | "STRAIGHT"
       speed_action: "ACCELERATE" | "SLOW" | "STOP"
     """
 
-    DANGER_OBSTACLE_M  = 1.0   # brake hard within this distance
-    CAUTION_OBSTACLE_M = 2.0   # slow down within this distance
+    # Distance thresholds for obstacle detection zones
+    DANGER_OBSTACLE_M  = 1.0   # Within this distance: hard brake required
+    CAUTION_OBSTACLE_M = 2.0   # Within this distance: reduce speed and start planning
 
-    MILD_HEADING_DEG  = 3.0
-    LARGE_HEADING_DEG = 15.0
+    # Thresholds for deciding when heading/offset errors are significant enough to act on
+    MILD_HEADING_DEG  = 3.0    # Small enough to ignore — within normal sensor noise
+    LARGE_HEADING_DEG = 15.0   # Large enough to warrant slowing down to correct safely
 
-    MILD_OFFSET_M  = 0.15
-    LARGE_OFFSET_M = 0.40
+    MILD_OFFSET_M  = 0.15      # Close enough to lane centre — no correction needed
+    LARGE_OFFSET_M = 0.40      # Far enough from centre to require reduced speed
 
+    # If going faster than this, we need good alignment before we're allowed to accelerate
     HIGH_SPEED_MPS = 3.0
 
-    # 1. Sensor failure — cannot trust any input
+    # ── Priority 1: Sensor validity ──────────────────────────────────────────
+    # If the sensor data is flagged as unreliable, we have no trustworthy
+    # information about the world. The only safe response is to stop in place.
     if not sensor_valid:                        # FIX bug 1: check was missing entirely
         return "STRAIGHT", "STOP"
 
-    # 2. Emergency stop — unconditional hard override
+    # ── Priority 2: Emergency stop ───────────────────────────────────────────
+    # An e_stop is a direct signal from the driver or safety system to halt
+    # immediately, regardless of what the sensors say about the environment.
+    # This must be checked unconditionally before anything else.
     if e_stop:                                  # FIX bug 2: was nested inside obstacle logic, could be bypassed
         return "STRAIGHT", "STOP"
 
-    # 3. Danger zone — brake hard, steer to clear side if one exists
+    # ── Priority 3: Danger zone (≤ 1.0 m) ───────────────────────────────────
+    # Obstacle is critically close. Brake hard. If one side is open, steer
+    # toward it to maximise clearance — but stopping is the priority either way.
     if obstacle_distance_m <= DANGER_OBSTACLE_M:    # FIX bug 3: was checked after caution zone, never reached
         if left_clear and not right_clear:
             return "LEFT", "STOP"              # FIX bug 4: was "RIGHT" (steered into blocked side)
         elif right_clear and not left_clear:
             return "RIGHT", "STOP"             # FIX bug 4: was "LEFT"
         else:
+            # Both sides blocked — can't dodge, just stop and hope for the best
             return "STRAIGHT", "STOP"
 
-    # 4. Caution zone — slow down, prefer clear side
+    # ── Priority 4: Caution zone (≤ 2.0 m) ──────────────────────────────────
+    # Obstacle is nearby but not yet critical. Slow down and prefer whichever
+    # side gives us an escape route.
     if obstacle_distance_m <= CAUTION_OBSTACLE_M:   # FIX bug 3: was checked before danger zone
         if not left_clear and not right_clear:
             return "STRAIGHT", "SLOW"
@@ -113,7 +141,8 @@ def controller(
         elif right_clear and not left_clear:
             return "RIGHT", "SLOW"             # FIX bug 4: was "LEFT"
         else:
-            # Both clear — slow and correct alignment while closing
+            # Both sides are clear — slow down and use heading/offset to stay aligned
+            # while closing on the obstacle
             if heading_error_deg > MILD_HEADING_DEG or lane_offset_m > MILD_OFFSET_M:
                 return "LEFT", "SLOW"
             elif heading_error_deg < -MILD_HEADING_DEG or lane_offset_m < -MILD_OFFSET_M:
@@ -121,14 +150,22 @@ def controller(
             else:
                 return "STRAIGHT", "SLOW"
 
-    # 5. Normal driving — correct heading/offset, manage speed by error severity
+    # ── Priority 5: Normal driving ────────────────────────────────────────────
+    # No safety condition was triggered. Focus on keeping the vehicle aligned
+    # and at a reasonable speed. Heading error and lane offset are checked
+    # together — heading takes implicit priority because it determines where
+    # the vehicle will be in the near future, not just where it is now.
+
     centered            = abs(lane_offset_m)     <= MILD_OFFSET_M
     small_heading_error = abs(heading_error_deg) <= MILD_HEADING_DEG
 
+    # Well aligned and centred — safe to accelerate
     if centered and small_heading_error:
         return "STRAIGHT", "ACCELERATE"
 
-    # Heading error takes priority over lane offset (determines future trajectory)
+    # Determine which direction needs correction
+    # Positive heading/offset = drifting right → steer LEFT to correct
+    # Negative heading/offset = drifting left  → steer RIGHT to correct
     if heading_error_deg > MILD_HEADING_DEG or lane_offset_m > MILD_OFFSET_M:
         steering = "LEFT"
     elif heading_error_deg < -MILD_HEADING_DEG or lane_offset_m < -MILD_OFFSET_M:
@@ -136,6 +173,8 @@ def controller(
     else:
         steering = "STRAIGHT"
 
+    # Slow down if the correction is large (harder to control at speed) or
+    # if we're already going fast (want good alignment before pushing further)
     large_error = (
         abs(heading_error_deg) > LARGE_HEADING_DEG or
         abs(lane_offset_m)     > LARGE_OFFSET_M
